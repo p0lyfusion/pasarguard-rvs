@@ -239,8 +239,16 @@ def devices(c: Ctx, user_id: int | None, as_json: bool):
     show_envvar=True,
     help="print every command and the xray config, change nothing",
 )
+@click.option(
+    "--allow-offline",
+    is_flag=True,
+    envvar="RVS_ALLOW_OFFLINE",
+    show_envvar=True,
+    help="with -d: open the shell even if the device isn't connected (needs a single node, e.g. --node); "
+    "traffic fails until it connects, then flows with nothing restarted",
+)
 @click.pass_obj
-def shell(c: Ctx, device: Device | None, query: str, shell_cmd: str, dry_run: bool, **entry):
+def shell(c: Ctx, device: Device | None, query: str, shell_cmd: str, dry_run: bool, allow_offline: bool, **entry):
     """Get a shell whose traffic exits through a device. Needs NET_ADMIN and /dev/net/tun."""
     if not dry_run and (os.geteuid() != 0 or not Path("/dev/net/tun").exists()):
         raise click.ClickException("needs root in a container with NET_ADMIN and /dev/net/tun (try --dry-run)")
@@ -248,15 +256,25 @@ def shell(c: Ctx, device: Device | None, query: str, shell_cmd: str, dry_run: bo
 
     if device:
         dev = device
-        nodes = c.nodes()
-        if len(nodes) > 1:
+        # A device account shows up in the nodes' online stats; the shared tunnel (no row) does not.
+        found = [o for o in c.online(dev.user_id) if o.device == dev] if dev.row_id is not None else []
+        if found:
+            node, main_uuid = found[0].node, found[0].user.main_uuid
+        elif dev.row_id is not None and not allow_offline:
             raise click.ClickException(
-                "several connected nodes; pick one with --node: " + ", ".join(n.name for n in nodes)
+                f"device {dev} is not connected to any selected node; "
+                "--allow-offline opens the shell anyway (traffic fails until it connects)"
             )
-        user = c.panel.user(dev.user_id)
-        if user is None:
-            raise click.ClickException(f"user {dev.user_id} has no VLESS id in the panel")
-        node, main_uuid = nodes[0], user.main_uuid
+        else:
+            nodes = c.nodes()
+            if len(nodes) > 1:
+                raise click.ClickException(
+                    "several connected nodes; pick one with --node: " + ", ".join(n.name for n in nodes)
+                )
+            user = c.panel.user(dev.user_id)
+            if user is None:
+                raise click.ClickException(f"user {dev.user_id} has no VLESS id in the panel")
+            node, main_uuid = nodes[0], user.main_uuid
     else:
         online = c.online()
         if not online:

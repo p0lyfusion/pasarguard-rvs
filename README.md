@@ -7,7 +7,7 @@ Everything runs in a container: the tun, routes and resolv.conf changes never to
 ```
 cp rvs.env.example .env && $EDITOR .env
 docker compose run --rm rvs                 # = rvs shell: pick a device, get a shell through it
-docker compose run --rm rvs shell -d 42.7   # no picker
+docker compose run --rm rvs shell -d 42.7   # no picker; finds the node the device is on, refuses if it's offline
 docker compose run --rm rvs devices         # list what's online
 ```
 
