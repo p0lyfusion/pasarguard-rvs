@@ -1,0 +1,21 @@
+# rvs: shells through Pasarguard reverse-tunnel devices. Interactive, so start it with `run`, not `up`:
+#
+#   cp rvs.env.example .env && $EDITOR .env    # .env is gitignored
+#   docker compose run --rm rvs                # = rvs shell: pick a device, get a shell through it
+#   docker compose run --rm rvs shell -q alice # pre-fill the search
+#   docker compose run --rm rvs shell -d 42.7  # no picker
+#   docker compose run --rm rvs devices        # just list what's online
+#
+# Flags beat .env. All network changes (tun, routes, resolv.conf) stay inside this container.
+services:
+  rvs:
+    image: rvs
+    build:
+      context: .
+    env_file: .env
+    stdin_open: true
+    tty: true
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    # Optional: a fixed node instead of the panel's list.
+    # volumes: ["./node.json:/node.json:ro"]     # then set RVS_NODE_CONFIG=/node.json

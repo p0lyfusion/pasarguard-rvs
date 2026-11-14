@@ -1,0 +1,7 @@
+# Build context: send only what the image uses.
+*
+!pyproject.toml
+!src/
+!proto/service.proto
+!scripts/regenerate_node_bridge_proto.py
+**/__pycache__
