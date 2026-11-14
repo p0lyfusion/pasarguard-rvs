@@ -4,6 +4,8 @@
   rvs devices          list the devices online on the panel's connected nodes
   rvs shell            fuzzy-pick one of them, get a shell whose traffic exits through it
   rvs shell -d 42.7    skip the picker
+  rvs standalone --json   an xray client config for the device, to run anywhere
+  rvs standalone --rule   the node routing rule that config needs (--hold: add it until Ctrl-C)
 
 Every option also reads an RVS_* environment variable (shown in --help); a flag beats its variable.
 """
@@ -12,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -20,9 +23,9 @@ from pathlib import Path
 import click
 import httpx
 
-from .node import Device, NodeConfig, NodeError, online_devices
+from .node import Device, NodeConfig, NodeError, hold_routing_rule, online_devices
 from .panel import Panel, PanelUser
-from .tunnel import SessionOptions, TunnelError, run_device_shell
+from .tunnel import SessionOptions, TunnelError, client_config, run_device_shell, session_rule
 
 log = logging.getLogger("pasarguard_rvs")
 DEFAULTS = SessionOptions()  # the library's defaults are the CLI's defaults
@@ -193,29 +196,82 @@ def devices(c: Ctx, user_id: int | None, as_json: bool):
             click.echo(_line(o))
 
 
+def _options(*opts):
+    def apply(f):
+        for o in reversed(opts):
+            f = o(f)
+        return f
+
+    return apply
+
+
+SELECT_OPTIONS = _options(
+    click.option(
+        "-d",
+        "--device",
+        envvar="RVS_DEVICE",
+        show_envvar=True,
+        callback=_device,
+        help="user_id[.row_id] to use without the picker (no row_id = the shared tunnel)",
+    ),
+    click.option("-q", "--query", default="", envvar="RVS_QUERY", show_envvar=True, help="pre-fill the fuzzy search"),
+    click.option(
+        "--allow-offline",
+        is_flag=True,
+        envvar="RVS_ALLOW_OFFLINE",
+        show_envvar=True,
+        help="with -d: go ahead even if the device isn't connected (needs a single node, e.g. --node); "
+        "traffic fails until it connects, then flows with nothing restarted",
+    ),
+)
+ENTRY_OPTIONS = _options(
+    click.option(
+        "--entry-encryption",
+        default=DEFAULTS.entry_encryption,
+        envvar="RVS_ENTRY_ENCRYPTION",
+        show_envvar=True,
+        help="client half of the entry inbound's VLESS encryption (`xray vlessenc`); "
+        "Xray refuses plain VLESS to a public address",
+    ),
+    click.option(
+        "--entry-host", envvar="RVS_ENTRY_HOST", show_envvar=True, help="data-plane address [default: node address]"
+    ),
+    click.option("--entry-port", default=DEFAULTS.entry_port, envvar="RVS_ENTRY_PORT", show_envvar=True),
+    click.option("--entry-tag", default=DEFAULTS.entry_tag, envvar="RVS_ENTRY_TAG", show_envvar=True),
+)
+
+
+def _select(c: Ctx, device: Device | None, query: str, allow_offline: bool) -> tuple[NodeConfig, Device, str]:
+    """(node, device, main uuid) from -d, or from the picker over the online devices."""
+    if device is None:
+        online = c.online()
+        if not online:
+            raise click.ClickException("no devices connected (or none of their users resolve in the panel)")
+        chosen = _pick(online, query)
+        if chosen is None:
+            raise click.ClickException("nothing selected")
+        return chosen.node, chosen.device, chosen.user.main_uuid
+    # A device account shows up in the nodes' online stats; the shared tunnel (no row) does not.
+    found = [o for o in c.online(device.user_id) if o.device == device] if device.row_id is not None else []
+    if found:
+        return found[0].node, device, found[0].user.main_uuid
+    if device.row_id is not None and not allow_offline:
+        raise click.ClickException(
+            f"device {device} is not connected to any selected node; "
+            "--allow-offline goes ahead anyway (traffic fails until it connects)"
+        )
+    nodes = c.nodes()
+    if len(nodes) > 1:
+        raise click.ClickException("several connected nodes; pick one with --node: " + ", ".join(n.name for n in nodes))
+    user = c.panel.user(device.user_id)
+    if user is None:
+        raise click.ClickException(f"user {device.user_id} has no VLESS id in the panel")
+    return nodes[0], device, user.main_uuid
+
+
 @main.command()
-@click.option(
-    "-d",
-    "--device",
-    envvar="RVS_DEVICE",
-    show_envvar=True,
-    callback=_device,
-    help="user_id[.row_id] to use without the picker (no row_id = the shared tunnel)",
-)
-@click.option("-q", "--query", default="", envvar="RVS_QUERY", show_envvar=True, help="pre-fill the fuzzy search")
-@click.option(
-    "--entry-encryption",
-    default=DEFAULTS.entry_encryption,
-    envvar="RVS_ENTRY_ENCRYPTION",
-    show_envvar=True,
-    help="client half of the entry inbound's VLESS encryption (`xray vlessenc`); "
-    "Xray refuses plain VLESS to a public address",
-)
-@click.option(
-    "--entry-host", envvar="RVS_ENTRY_HOST", show_envvar=True, help="data-plane address [default: node address]"
-)
-@click.option("--entry-port", default=DEFAULTS.entry_port, envvar="RVS_ENTRY_PORT", show_envvar=True)
-@click.option("--entry-tag", default=DEFAULTS.entry_tag, envvar="RVS_ENTRY_TAG", show_envvar=True)
+@SELECT_OPTIONS
+@ENTRY_OPTIONS
 @click.option("--mtu", default=DEFAULTS.mtu, envvar="RVS_MTU", show_envvar=True)
 @click.option(
     "--dns",
@@ -239,57 +295,77 @@ def devices(c: Ctx, user_id: int | None, as_json: bool):
     show_envvar=True,
     help="print every command and the xray config, change nothing",
 )
-@click.option(
-    "--allow-offline",
-    is_flag=True,
-    envvar="RVS_ALLOW_OFFLINE",
-    show_envvar=True,
-    help="with -d: open the shell even if the device isn't connected (needs a single node, e.g. --node); "
-    "traffic fails until it connects, then flows with nothing restarted",
-)
 @click.pass_obj
-def shell(c: Ctx, device: Device | None, query: str, shell_cmd: str, dry_run: bool, allow_offline: bool, **entry):
+def shell(c: Ctx, device, query: str, allow_offline: bool, shell_cmd: str, dry_run: bool, **entry):
     """Get a shell whose traffic exits through a device. Needs NET_ADMIN and /dev/net/tun."""
     if not dry_run and (os.geteuid() != 0 or not Path("/dev/net/tun").exists()):
         raise click.ClickException("needs root in a container with NET_ADMIN and /dev/net/tun (try --dry-run)")
     opts = SessionOptions(shell=shell_cmd, dry_run=dry_run, **entry)
-
-    if device:
-        dev = device
-        # A device account shows up in the nodes' online stats; the shared tunnel (no row) does not.
-        found = [o for o in c.online(dev.user_id) if o.device == dev] if dev.row_id is not None else []
-        if found:
-            node, main_uuid = found[0].node, found[0].user.main_uuid
-        elif dev.row_id is not None and not allow_offline:
-            raise click.ClickException(
-                f"device {dev} is not connected to any selected node; "
-                "--allow-offline opens the shell anyway (traffic fails until it connects)"
-            )
-        else:
-            nodes = c.nodes()
-            if len(nodes) > 1:
-                raise click.ClickException(
-                    "several connected nodes; pick one with --node: " + ", ".join(n.name for n in nodes)
-                )
-            user = c.panel.user(dev.user_id)
-            if user is None:
-                raise click.ClickException(f"user {dev.user_id} has no VLESS id in the panel")
-            node, main_uuid = nodes[0], user.main_uuid
-    else:
-        online = c.online()
-        if not online:
-            raise click.ClickException("no devices connected (or none of their users resolve in the panel)")
-        chosen = _pick(online, query)
-        if chosen is None:
-            raise click.ClickException("nothing selected")
-        node, dev, main_uuid = chosen.node, chosen.device, chosen.user.main_uuid
+    node, dev, main_uuid = _select(c, device, query, allow_offline)
     run_device_shell(node, dev, main_uuid, opts)
+
+
+@main.command()
+@SELECT_OPTIONS
+@ENTRY_OPTIONS
+@click.option("--json", "as_json", is_flag=True, help="print an xray client config (SOCKS5 + HTTP on 127.0.0.1)")
+@click.option("--rule", "as_rule", is_flag=True, help="print the node routing rule that config needs")
+@click.option("--hold", is_flag=True, help="with --rule: add it on the node instead, and remove it on Ctrl-C")
+@click.option(
+    "--socks-port",
+    default=10808,
+    envvar="RVS_SOCKS_PORT",
+    show_envvar=True,
+    help="--json: SOCKS5 port; HTTP is the next one",
+)
+@click.option(
+    "-o", "--output", type=click.File("w"), default="-", help="where --json/--rule go (a file keeps the picker usable)"
+)
+@click.pass_obj
+def standalone(
+    c: Ctx,
+    device,
+    query: str,
+    allow_offline: bool,
+    as_json: bool,
+    as_rule: bool,
+    hold: bool,
+    socks_port: int,
+    output,
+    **entry,
+):
+    """No local tunnel: the pieces to reach a device from your own xray.
+
+    \b
+      --json          client config: run it with `xray run -c`, then use socks5h://127.0.0.1:10808
+      --rule          the rule for the node's routing, ahead of any rule matching the entry inbound
+      --rule --hold   add that rule over the node API for as long as this runs
+
+    Without the rule the node routes the entry traffic by its own rules, so the config then exits at
+    the node (or wherever those rules send it), not at the device.
+    """
+    if as_json == as_rule:
+        raise click.UsageError("give exactly one of --json, --rule")
+    if hold and not as_rule:
+        raise click.UsageError("--hold goes with --rule")
+    opts = SessionOptions(**entry)
+    node, dev, main_uuid = _select(c, device, query, allow_offline)
+    rule = session_rule(dev, opts.entry_tag)
+    log.info("device %s on node %s", dev, node.name)
+    if hold:
+        asyncio.run(hold_routing_rule(node, rule))
+        return
+    doc = client_config(main_uuid, opts.entry_host or node.address, opts, socks_port) if as_json else rule
+    output.write(json.dumps(doc, indent=2) + "\n")
+    output.flush()
 
 
 def _pick(online: list[Online], query: str) -> Online | None:
     from InquirerPy import inquirer
     from InquirerPy.base.control import Choice
 
+    if not sys.stdout.isatty():
+        raise click.ClickException("the picker needs a terminal on stdout: give -d, or -o FILE")
     # The value is the list index: InquirerPy hands back an object value as a dict, not the object.
     try:
         index = inquirer.fuzzy(

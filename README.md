@@ -13,6 +13,23 @@ docker compose run --rm rvs devices         # list what's online
 
 Inside the shell, `curl -s ifconfig.me` should print the device's public IP.
 
+## Standalone: your own xray instead of the container's tunnel
+
+```
+docker compose run --rm -T rvs standalone --json -d 42.7 > 42.7.json
+docker compose run --rm -T rvs standalone --rule -d 42.7          # rule JSON for the node's admin
+docker compose run --rm rvs standalone --rule --hold -d 42.7      # or add it yourself until Ctrl-C
+xray run -c 42.7.json; curl -x socks5h://127.0.0.1:10808 ifconfig.me
+```
+
+The config is SOCKS5 + HTTP on 127.0.0.1 (no root, no tun) out to the entry inbound as the user's
+main UUID; it reaches the device only while the node has the rule. A permanent rule goes in the
+node's routing ahead of any rule matching the entry inbound. Without it, the node routes that
+traffic by its own rules, so it exits at the node, not the device. The entry port's firewall must
+allow wherever you run xray. `-T` keeps the status lines (stderr) out of a redirected file, and
+leaves no terminal for the picker, so give `-d`; to pick interactively, write with `-o` into a
+mounted directory instead.
+
 ## Requirements
 
 - **Panel and node on the reverse v2 build.** The panel sends each user's devices to the nodes; only a

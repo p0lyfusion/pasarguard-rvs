@@ -5,8 +5,10 @@ address/port/server_ca/api_key the panel uses. Nothing here starts, stops or rec
 node's backend: the reads are GetUsersOnlineIpListStats, the writes AddRoutingRule/RemoveRoutingRule.
 """
 
+import asyncio
 import json
 import logging
+import signal
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -146,3 +148,14 @@ async def routing_rule(node: NodeConfig, rule: dict) -> AsyncIterator[None]:
         except Exception as exc:
             log.error("failed to remove rule %s on node %s: %s -- remove it by hand", rule["ruleTag"], node.name, exc)
         _close(bridge)
+
+
+async def hold_routing_rule(node: NodeConfig, rule: dict) -> None:
+    """Add `rule` on the node and keep it until SIGINT/SIGTERM, then remove it."""
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+    async with routing_rule(node, rule):
+        log.info("holding rule %s on %s; Ctrl-C removes it", rule["ruleTag"], node.name)
+        await stop.wait()

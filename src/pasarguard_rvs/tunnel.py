@@ -93,6 +93,24 @@ class Runner:
                 log.error("teardown '%s' failed: %s", desc, exc)
 
 
+def _entry_outbound(main_uuid: str, entry_ip: str, entry_port: int, encryption: str) -> dict:
+    """The user's MAIN uuid to the node's entry inbound; the node rule takes it on to the device."""
+    return {
+        "tag": "entry",
+        "protocol": "vless",
+        "settings": {
+            "vnext": [
+                {
+                    "address": entry_ip,
+                    "port": entry_port,
+                    "users": [{"id": main_uuid, "encryption": encryption, "flow": ""}],
+                }
+            ]
+        },
+        "streamSettings": {"network": "tcp", "security": "none"},
+    }
+
+
 def xray_config(main_uuid: str, entry_ip: str, entry_port: int, mtu: int, encryption: str) -> dict:
     return {
         "log": {"loglevel": "warning"},
@@ -109,23 +127,27 @@ def xray_config(main_uuid: str, entry_ip: str, entry_port: int, mtu: int, encryp
                 },
             }
         ],
-        "outbounds": [
-            {
-                "tag": "entry",
-                "protocol": "vless",
-                "settings": {
-                    "vnext": [
-                        {
-                            "address": entry_ip,
-                            "port": entry_port,
-                            "users": [{"id": main_uuid, "encryption": encryption, "flow": ""}],
-                        }
-                    ]
-                },
-                "streamSettings": {"network": "tcp", "security": "none"},
-            }
-        ],
+        "outbounds": [_entry_outbound(main_uuid, entry_ip, entry_port, encryption)],
         "routing": {"rules": [{"inboundTag": ["tun"], "outboundTag": "entry"}]},
+    }
+
+
+def client_config(main_uuid: str, entry_host: str, opts: SessionOptions, socks_port: int) -> dict:
+    """A standalone xray config: SOCKS5 on 127.0.0.1:socks_port and HTTP on socks_port+1, out via the device.
+
+    Needs no root and no tun, so it runs anywhere xray does. Names travel to the device unresolved
+    (socks5h / HTTP CONNECT), so they resolve on the device's side. Reaches the device only while the
+    node has session_rule(device) for this user.
+    """
+    local = {"listen": "127.0.0.1", "settings": {}}
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {"tag": "socks", "protocol": "socks", "port": socks_port, **local, "settings": {"udp": True}},
+            {"tag": "http", "protocol": "http", "port": socks_port + 1, **local},
+        ],
+        "outbounds": [_entry_outbound(main_uuid, entry_host, opts.entry_port, opts.entry_encryption)],
+        "routing": {"rules": [{"inboundTag": ["socks", "http"], "outboundTag": "entry"}]},
     }
 
 
