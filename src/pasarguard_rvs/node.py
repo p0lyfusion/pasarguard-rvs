@@ -1,4 +1,4 @@
-"""Node side: connection details, which devices are online, and the ad-hoc routing rule.
+"""Node side: connection details, which devices are online, and holding a routing rule.
 
 Everything here talks to the node's gRPC API through pasarguard-node-bridge with the same
 address/port/server_ca/api_key the panel uses. Nothing here starts, stops or reconfigures the
@@ -9,7 +9,7 @@ import asyncio
 import json
 import logging
 import signal
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,8 +17,8 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
-class NodeError(RuntimeError):
-    pass
+class RvsError(RuntimeError):
+    """Every expected failure (panel, node, tunnel); the CLI prints it as one line."""
 
 
 @dataclass(frozen=True)
@@ -35,7 +35,7 @@ class NodeConfig:
         raw = json.loads(Path(path).read_text())
         missing = [k for k in ("address", "port", "api_key", "server_ca") if not raw.get(k)]
         if missing:
-            raise NodeError(f"{path}: missing {', '.join(missing)}")
+            raise RvsError(f"{path}: missing {', '.join(missing)}")
         return cls(
             name=raw.get("name") or raw["address"],
             address=raw["address"],
@@ -80,7 +80,7 @@ def _bridge(node: NodeConfig):
             api_port=node.port,
         )
     except NodeAPIError as exc:  # raised for a bad api_key / server_ca before any call
-        raise NodeError(f"node {node.name}: {exc.detail}") from exc
+        raise RvsError(f"node {node.name}: {exc.detail}") from exc
 
 
 def _close(bridge) -> None:
@@ -104,13 +104,13 @@ async def online_devices(node: NodeConfig) -> dict[Device, dict[str, int]]:
     client = getattr(bridge, "_client", None)
     handle = getattr(bridge, "_handle_grpc_request", None)
     if client is None or handle is None or not hasattr(client, "GetUsersOnlineIpListStats"):
-        raise NodeError(
+        raise RvsError(
             "bridge has no GetUsersOnlineIpListStats stub; regenerate it with scripts/regenerate_node_bridge_proto.py"
         )
     try:
         resp = await handle(method=client.GetUsersOnlineIpListStats, request=service.Empty())
     except NodeAPIError as exc:
-        raise NodeError(f"node {node.name}: {exc.detail} (code {exc.code})") from exc
+        raise RvsError(f"node {node.name}: {exc.detail} (code {exc.code})") from exc
     finally:
         _close(bridge)
     if resp is None:
@@ -138,7 +138,7 @@ async def routing_rule(node: NodeConfig, rule: dict) -> AsyncIterator[None]:
         try:
             await bridge.add_routing_rule(json.dumps(rule), should_reset=False)
         except NodeAPIError as exc:
-            raise NodeError(f"node {node.name}: adding rule failed: {exc.detail} (code {exc.code})") from exc
+            raise RvsError(f"node {node.name}: adding rule failed: {exc.detail} (code {exc.code})") from exc
         log.info("node %s: routing rule %s added", node.name, rule["ruleTag"])
         yield
     finally:
@@ -150,12 +150,21 @@ async def routing_rule(node: NodeConfig, rule: dict) -> AsyncIterator[None]:
         _close(bridge)
 
 
-async def hold_routing_rule(node: NodeConfig, rule: dict) -> None:
-    """Add `rule` on the node and keep it until SIGINT/SIGTERM, then remove it."""
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
-    async with routing_rule(node, rule):
-        log.info("holding rule %s on %s; Ctrl-C removes it", rule["ruleTag"], node.name)
-        await stop.wait()
+def hold_rule(node: NodeConfig, rule: dict, during: Callable[[], object] | None = None) -> None:
+    """Add `rule` on the node, run the blocking `during()` (or, without one, wait for SIGINT/SIGTERM),
+    and always remove the rule afterwards."""
+
+    async def go():
+        if during:
+            async with routing_rule(node, rule):
+                await asyncio.to_thread(during)
+            return
+        # before the add: a signal during the add RPC still ends in the removal
+        stop = asyncio.Event()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+        async with routing_rule(node, rule):
+            log.info("holding rule %s on %s; Ctrl-C removes it", rule["ruleTag"], node.name)
+            await stop.wait()
+
+    asyncio.run(go())
