@@ -12,7 +12,6 @@ import signal
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -28,21 +27,6 @@ class NodeConfig:
     port: int
     api_key: str
     server_ca: str = field(repr=False)
-
-    @classmethod
-    def from_file(cls, path: str | Path) -> NodeConfig:
-        """JSON with address, port, api_key, server_ca (PEM); optional name."""
-        raw = json.loads(Path(path).read_text())
-        missing = [k for k in ("address", "port", "api_key", "server_ca") if not raw.get(k)]
-        if missing:
-            raise RvsError(f"{path}: missing {', '.join(missing)}")
-        return cls(
-            name=raw.get("name") or raw["address"],
-            address=raw["address"],
-            port=int(raw["port"]),
-            api_key=raw["api_key"],
-            server_ca=raw["server_ca"],
-        )
 
 
 @dataclass(frozen=True, order=True)

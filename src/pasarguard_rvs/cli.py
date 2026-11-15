@@ -8,6 +8,8 @@
   rvs standalone --rule   the node routing rule that config needs (--hold: add it until Ctrl-C)
 
 Every option also reads an RVS_* environment variable (shown in --help); a flag beats its variable.
+The entry inbound's address, port and tag are environment-only: RVS_ENTRY_HOST (default: the
+node's address), RVS_ENTRY_PORT (10900), RVS_ENTRY_TAG (RVS_ENTRY).
 """
 
 import json
@@ -38,7 +40,6 @@ class Ctx:
     admin: str | None
     password: str | None = field(repr=False)
     node_name: str | None
-    node_config: Path | None
 
     @cached_property
     def panel(self) -> Panel:
@@ -58,8 +59,6 @@ class Ctx:
 
     @cached_property
     def nodes(self) -> list[NodeConfig]:
-        if self.node_config:
-            return [NodeConfig.from_file(self.node_config)]
         if nodes := self.panel.nodes(self.node_name):
             return nodes
         raise click.ClickException(
@@ -132,19 +131,23 @@ TARGET_OPTIONS = _options(
         "traffic fails until it connects, then flows with nothing restarted",
     ),
 )
-ENTRY_OPTIONS = _options(
-    opt(
-        "--entry-encryption",
-        "encryption",
-        default=ENTRY.encryption,
-        env="RVS_ENTRY_ENCRYPTION",
-        help="client half of the entry inbound's VLESS encryption (`xray vlessenc`); "
-        "Xray refuses plain VLESS to a public address",
-    ),
-    opt("--entry-host", "host", env="RVS_ENTRY_HOST", help="data-plane address [default: node address]"),
-    opt("--entry-port", "port", default=ENTRY.port, env="RVS_ENTRY_PORT"),
-    opt("--entry-tag", "tag", default=ENTRY.tag, env="RVS_ENTRY_TAG"),
+ENTRY_OPTION = opt(
+    "--entry-encryption",
+    "encryption",
+    default=ENTRY.encryption,
+    env="RVS_ENTRY_ENCRYPTION",
+    help="client half of the entry inbound's VLESS encryption (`xray vlessenc`); "
+    "Xray refuses plain VLESS to a public address",
 )
+
+
+def _entry(encryption: str) -> Entry:
+    """--entry-encryption plus the environment-only RVS_ENTRY_HOST / RVS_ENTRY_PORT / RVS_ENTRY_TAG."""
+    port = os.environ.get("RVS_ENTRY_PORT") or str(ENTRY.port)
+    if not port.isdigit():
+        raise click.UsageError(f"RVS_ENTRY_PORT={port!r} is not a port number")
+    host, tag = os.environ.get("RVS_ENTRY_HOST") or None, os.environ.get("RVS_ENTRY_TAG") or ENTRY.tag
+    return Entry(encryption, host, int(port), tag)
 
 
 @click.group(cls=_Group, context_settings={"show_default": True, "help_option_names": ["-h", "--help"]}, help=__doc__)
@@ -152,17 +155,11 @@ ENTRY_OPTIONS = _options(
 @opt("--admin", env="RVS_PANEL_ADMIN", help="panel admin with users:read + nodes:read")
 @opt("--password", env="RVS_PANEL_PASSWORD", help="prefer the env var: argv shows up in ps and shell history")
 @opt("--node", "node_name", env="RVS_NODE", help="only this panel node (default: every connected gRPC node)")
-@opt(
-    "--node-config",
-    env="RVS_NODE_CONFIG",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    help="JSON with address, port, api_key, server_ca: use this node instead of the panel's list",
-)
 @click.pass_context
-def main(ctx: click.Context, panel, admin, password, node_name, node_config):
+def main(ctx: click.Context, panel, admin, password, node_name):
     logging.basicConfig(level=logging.INFO, format="  %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # no per-request lines
-    ctx.obj = Ctx(panel, admin, password, node_name, node_config)
+    ctx.obj = Ctx(panel, admin, password, node_name)
 
 
 @main.command()
@@ -195,7 +192,7 @@ def devices(c: Ctx, user_id: int | None, as_json: bool):
 
 @main.command()
 @TARGET_OPTIONS
-@ENTRY_OPTIONS
+@ENTRY_OPTION
 @opt("--mtu", default=SESSION.mtu, env="RVS_MTU")
 @opt("--dns", default=SESSION.dns, env="RVS_DNS", help="resolver the shell uses, reached through the device")
 @opt(
@@ -207,17 +204,17 @@ def devices(c: Ctx, user_id: int | None, as_json: bool):
 )
 @opt("--dry-run", is_flag=True, env="RVS_DRY_RUN", help="print every command and the xray config, change nothing")
 @click.pass_obj
-def shell(c: Ctx, device, query, allow_offline, mtu, dns, shell_cmd, dry_run, **entry):
+def shell(c: Ctx, device, query, allow_offline, encryption, mtu, dns, shell_cmd, dry_run):
     """Get a shell whose traffic exits through a device. Needs NET_ADMIN and /dev/net/tun."""
     if not dry_run and (os.geteuid() != 0 or not Path("/dev/net/tun").exists()):
         raise click.ClickException("needs root in a container with NET_ADMIN and /dev/net/tun (try --dry-run)")
     target = c.target(device, query, allow_offline)
-    run_device_shell(target, Entry(**entry), SessionOptions(mtu, dns, shell_cmd, dry_run))
+    run_device_shell(target, _entry(encryption), SessionOptions(mtu, dns, shell_cmd, dry_run))
 
 
 @main.command()
 @TARGET_OPTIONS
-@ENTRY_OPTIONS
+@ENTRY_OPTION
 @opt("--json", "as_json", is_flag=True, help="print an xray client config (SOCKS5 + HTTP on 127.0.0.1)")
 @opt("--rule", "as_rule", is_flag=True, help="print the node routing rule that config needs")
 @opt("--hold", is_flag=True, help="with --rule: add it on the node instead, and remove it on Ctrl-C")
@@ -226,7 +223,7 @@ def shell(c: Ctx, device, query, allow_offline, mtu, dns, shell_cmd, dry_run, **
     "-o", "--output", type=click.File("w"), default="-", help="where --json/--rule go (a file keeps the picker usable)"
 )
 @click.pass_obj
-def standalone(c: Ctx, device, query, allow_offline, as_json, as_rule, hold, socks_port, output, **entry):
+def standalone(c: Ctx, device, query, allow_offline, encryption, as_json, as_rule, hold, socks_port, output):
     """No local tunnel: the pieces to reach a device from your own xray.
 
     \b
@@ -243,7 +240,7 @@ def standalone(c: Ctx, device, query, allow_offline, as_json, as_rule, hold, soc
         raise click.UsageError("--hold goes with --rule")
     target = c.target(device, query, allow_offline)
     log.info("device %s on node %s", target.device, target.node.name)
-    entry = Entry(**entry)
+    entry = _entry(encryption)
     rule = device_rule(target.device, entry.tag)
     if hold:
         hold_rule(target.node, rule)

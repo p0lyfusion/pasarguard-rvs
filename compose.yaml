@@ -17,5 +17,3 @@ services:
     tty: true
     cap_add: [NET_ADMIN]
     devices: ["/dev/net/tun:/dev/net/tun"]
-    # Optional: a fixed node instead of the panel's list.
-    # volumes: ["./node.json:/node.json:ro"]     # then set RVS_NODE_CONFIG=/node.json
