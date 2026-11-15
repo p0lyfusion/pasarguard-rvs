@@ -16,7 +16,7 @@ HALF_ROUTES = ["0.0.0.0/1", "128.0.0.0/1"]  # beat the default route without rep
 
 @dataclass(frozen=True)
 class Entry:
-    """The node's entry inbound (`_rvs_entry`) as a client sees it."""
+    """The node's entry inbound (a plain VLESS inbound, found by tag) as a client sees it."""
 
     encryption: str = "none"  # client half of its VLESS encryption (`xray vlessenc`)
     host: str | None = None  # data-plane address; default: the node's address

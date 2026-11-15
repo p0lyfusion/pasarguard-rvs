@@ -35,7 +35,8 @@ mounted directory instead.
 - **Panel and node on the reverse v2 build.** The panel sends each user's devices to the nodes; only a
   v2 node turns them into per-device accounts (`<uid>.<row>`) on the `_is_reverse` inbound. A v1 node
   accepts the main account but rejects every device UUID (`invalid request user id` on that inbound).
-- **Entry inbound** (`_rvs_entry`, default tag `RVS_ENTRY`, port 10900) with VLESS encryption: the
+- **Entry inbound**: a plain VLESS inbound found by tag (`RVS_ENTRY_TAG`, default `RVS_ENTRY`, port
+  10900; no marker, `_level` optional) with VLESS encryption: the
   node holds `decryption`, `.env` holds the matching `encryption` half (`xray vlessenc`). Xray refuses
   plain VLESS to a public address. Firewall the port to this container's egress IP: the user's main
   UUID is not a secret.
