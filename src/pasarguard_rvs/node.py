@@ -117,10 +117,21 @@ async def routing_rule(node: NodeConfig, rule: dict) -> AsyncIterator[None]:
     """Add `rule` (with a "ruleTag") on the node for the duration of the block; always remove it."""
     from PasarGuardNodeBridge import NodeAPIError
 
+    tag = rule["ruleTag"]
     bridge = _bridge(node)
     try:
         try:
-            await bridge.add_routing_rule(json.dumps(rule), should_reset=False)
+            try:
+                await bridge.add_routing_rule(json.dumps(rule), should_reset=False)
+            except NodeAPIError as exc:
+                if "duplicate ruleTag" not in str(exc.detail):
+                    raise
+                # Left by a session that did not exit cleanly. The tag is per device, so the old
+                # rule is this same rule: replace it. (A session for this device that is still
+                # running loses its rule too -- one session per device is all the tag allows.)
+                log.warning("node %s: rule %s already there (stale session?); replacing it", node.name, tag)
+                await bridge.remove_routing_rule(tag)
+                await bridge.add_routing_rule(json.dumps(rule), should_reset=False)
         except NodeAPIError as exc:
             raise RvsError(f"node {node.name}: adding rule failed: {exc.detail} (code {exc.code})") from exc
         log.info("node %s: routing rule %s added", node.name, rule["ruleTag"])
