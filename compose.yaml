@@ -10,6 +10,8 @@
 # Flags beat .env. All network changes (tun, routes, resolv.conf) stay inside this container.
 services:
   rvs:
+    volumes:
+        - "~/git/polyfusion/tlsprobe/:/tlsprobe"
     image: rvs
     build:
       context: .
