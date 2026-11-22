@@ -2,7 +2,8 @@
 
 Everything here talks to the node's gRPC API through pasarguard-node-bridge with the same
 address/port/server_ca/api_key the panel uses. Nothing here starts, stops or reconfigures the
-node's backend: the reads are GetUsersOnlineIpListStats, the writes AddRoutingRule/RemoveRoutingRule.
+node's backend: the reads are GetUsersOnlineIpListStats, ListRoutingRules and TestRoute, the writes
+AddRoutingRule/RemoveRoutingRule.
 """
 
 import asyncio
@@ -110,66 +111,96 @@ async def online_devices(node: NodeConfig) -> dict[Device, dict[str, int]]:
     return devices
 
 
-async def _add_rule(bridge, node: NodeConfig, rule: dict) -> None:
+RULE_PREFIX = "rvs-shell-"  # every rule rvs adds: rvs-shell-<user_id>[.<row_id>][-<owner>]
+
+
+def rule_user(tag: str) -> int | None:
+    """The user an rvs rule routes, from its tag; None for any other rule."""
+    if not tag.startswith(RULE_PREFIX):
+        return None
+    try:
+        return Device.parse(tag.removeprefix(RULE_PREFIX).split("-", 1)[0]).user_id
+    except ValueError:
+        return None
+
+
+def _on_bridge(node: NodeConfig, call):
+    """`await call(bridge)` on a fresh bridge to the node, closing it afterwards."""
+
+    async def go():
+        bridge = _bridge(node)
+        try:
+            return await call(bridge)
+        finally:
+            _close(bridge)
+
+    return asyncio.run(go())
+
+
+def add_rule(node: NodeConfig, rule: dict, take_over: bool = False) -> None:
+    """Add `rule` (with a "ruleTag") on the node. Refused while any rvs rule routes the same user
+    there: the node matches entry traffic by user only, so a second rule would either never win or
+    steal the first one's traffic. take_over removes those rules first."""
     from PasarGuardNodeBridge import NodeAPIError
 
-    tag = rule["ruleTag"]
+    user = int(rule["user"][0])
+
+    async def call(bridge):
+        listed = await bridge.list_routing_rules()
+        clash = [r.rule_tag for r in (listed.rules if listed else []) if rule_user(r.rule_tag) == user]
+        if clash and not take_over:
+            raise RvsError(
+                f"node {node.name}: user {user} is already routed by {', '.join(clash)} (another rvs session, or "
+                "one that didn't exit cleanly); --take-over replaces it"
+            )
+        for old in clash:
+            log.warning("node %s: taking over: removing rule %s", node.name, old)
+            await bridge.remove_routing_rule(old)
+        await bridge.add_routing_rule(json.dumps(rule), should_reset=False)
+
     try:
-        try:
-            await bridge.add_routing_rule(json.dumps(rule), should_reset=False)
-        except NodeAPIError as exc:
-            if "duplicate ruleTag" not in str(exc.detail):
-                raise
-            # Left by a session that did not exit cleanly. The tag is per device, so the old
-            # rule is this same rule: replace it. (A session for this device that is still
-            # running loses its rule too -- one session per device is all the tag allows.)
-            log.warning("node %s: rule %s already there (stale session?); replacing it", node.name, tag)
-            await bridge.remove_routing_rule(tag)
-            await bridge.add_routing_rule(json.dumps(rule), should_reset=False)
+        _on_bridge(node, call)
     except NodeAPIError as exc:
         raise RvsError(f"node {node.name}: adding rule failed: {exc.detail} (code {exc.code})") from exc
-    log.info("node %s: routing rule %s added", node.name, tag)
+    log.info("node %s: routing rule %s added", node.name, rule["ruleTag"])
 
 
-async def _remove_rule(bridge, node: NodeConfig, tag: str) -> None:
+def remove_rule(node: NodeConfig, tag: str) -> None:
     from PasarGuardNodeBridge import NodeAPIError
 
     try:
-        await bridge.remove_routing_rule(tag)
+        _on_bridge(node, lambda bridge: bridge.remove_routing_rule(tag))
     except NodeAPIError as exc:
         raise RvsError(f"node {node.name}: removing rule {tag} failed: {exc.detail} (code {exc.code})") from exc
     log.info("node %s: routing rule %s removed", node.name, tag)
 
 
-def _on_bridge(node: NodeConfig, call) -> None:
-    """Run `await call(bridge)` on a fresh bridge to the node, closing it afterwards."""
+def route(node: NodeConfig, inbound_tag: str, user: int) -> str | None:
+    """The outbound the node picks now for `user`'s TCP traffic on `inbound_tag`; None when no rule
+    matches (the node then uses its default outbound)."""
+    from PasarGuardNodeBridge import NodeAPIError
 
-    async def go():
-        bridge = _bridge(node)
-        try:
-            await call(bridge)
-        finally:
-            _close(bridge)
-
-    asyncio.run(go())
-
-
-def add_rule(node: NodeConfig, rule: dict) -> None:
-    """Add `rule` (with a "ruleTag") on the node; an identical stale one is replaced."""
-    _on_bridge(node, lambda bridge: _add_rule(bridge, node, rule))
-
-
-def remove_rule(node: NodeConfig, tag: str) -> None:
-    _on_bridge(node, lambda bridge: _remove_rule(bridge, node, tag))
+    try:
+        result = _on_bridge(
+            node,
+            lambda bridge: bridge.test_route(
+                inbound_tag=inbound_tag, user=str(user), network="tcp", target_ip="1.1.1.1", target_port=443
+            ),
+        )
+    except NodeAPIError as exc:
+        if "not enough information" in str(exc.detail):  # xray's ErrNoClue: no rule matched
+            return None
+        raise RvsError(f"node {node.name}: route test failed: {exc.detail} (code {exc.code})") from exc
+    return result.outbound_tag if result else None
 
 
-def hold_rule(node: NodeConfig, rule: dict) -> None:
+def hold_rule(node: NodeConfig, rule: dict, take_over: bool = False) -> None:
     """Add `rule` on the node, wait for SIGINT/SIGTERM, and always remove the rule afterwards."""
     stop = (signal.SIGINT, signal.SIGTERM)
     # blocked from before the add: a signal during the add RPC is kept, and still ends in the removal
     signal.pthread_sigmask(signal.SIG_BLOCK, stop)
     try:
-        add_rule(node, rule)
+        add_rule(node, rule, take_over)
         try:
             log.info("holding rule %s on %s; Ctrl-C removes it", rule["ruleTag"], node.name)
             signal.sigwait(stop)

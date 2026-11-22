@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -23,20 +23,43 @@ class Target:
     user: PanelUser
     ips: dict[str, int] = field(default_factory=dict)  # ingress IP -> last seen; empty when offline
 
-    def to_json(self) -> dict:
-        return {"node": asdict(self.node), "device": str(self.device), "user": asdict(self.user), "ips": self.ips}
-
-    @classmethod
-    def from_json(cls, d: dict) -> Target:
-        return cls(NodeConfig(**d["node"]), Device.parse(d["device"]), PanelUser(**d["user"]), d["ips"])
-
     @property
     def line(self) -> str:
         """One line for lists and the picker."""
         return f"{self.user.username}  {self.device}  {self.node.name}  {', '.join(sorted(self.ips))}"
 
 
-def nodes(panel: Panel, name: str | None = None) -> list[NodeConfig]:
+@dataclass(frozen=True)
+class Fleet:
+    """The panel's connected nodes (only `node_name`, if set) and their devices. Every call logs in
+    afresh, so a long session never holds an expired token."""
+
+    panel_url: str
+    admin: str
+    password: str = field(repr=False)
+    node_name: str | None = None
+
+    def nodes(self) -> list[NodeConfig]:
+        with self._panel() as panel:
+            return connected_nodes(panel, self.node_name)
+
+    def online(self, user_id: int | None = None) -> list[Target]:
+        with self._panel() as panel:
+            return online(panel, connected_nodes(panel, self.node_name), user_id)
+
+    def find(self, device: Device, node_name: str | None = None, allow_offline: bool = False) -> Target:
+        """See `find`; node_name narrows it to that node (e.g. the one a picker line showed)."""
+        with self._panel() as panel:
+            return find(panel, connected_nodes(panel, node_name or self.node_name), device, allow_offline)
+
+    def _panel(self) -> Panel:
+        try:
+            return Panel(self.panel_url, self.admin, self.password)
+        except httpx.HTTPError as exc:
+            raise RvsError(f"panel login failed: {exc}") from exc
+
+
+def connected_nodes(panel: Panel, name: str | None = None) -> list[NodeConfig]:
     """The panel's connected gRPC nodes (only `name`, if given); none is an error."""
     if found := panel.nodes(name):
         return found

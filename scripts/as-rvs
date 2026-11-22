@@ -1,0 +1,6 @@
+#!/bin/sh
+# The image's entrypoint: runs the command as rvs's uid (7777, routing.RVS_UID), which the session
+# routes around its tun, keeping the capabilities the session needs: NET_ADMIN for routes and xray's
+# tun, SETUID/SETGID to start the shell as root, DAC_OVERRIDE for resolv.conf and /run/rvs.sock.
+caps=+net_admin,+setuid,+setgid,+dac_override
+exec setpriv --reuid=7777 --regid=7777 --clear-groups --inh-caps=$caps --ambient-caps=$caps -- "$@"

@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends iproute2 curl d
     && rm -rf /var/lib/apt/lists/*
 COPY --from=xray /usr/local/bin/xray /usr/local/bin/xray
 COPY --from=builder /opt/venv /opt/venv
+COPY scripts/as-rvs /usr/local/bin/as-rvs
 ENV PATH=/opt/venv/bin:$PATH
-ENTRYPOINT ["rvs"]
+ENTRYPOINT ["as-rvs", "rvs"]
 CMD ["session"]

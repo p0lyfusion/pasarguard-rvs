@@ -16,21 +16,18 @@ node's address), RVS_ENTRY_PORT (10900), RVS_ENTRY_TAG (RVS_ENTRY).
 import json
 import logging
 import os
+import secrets
 import socket
 import sys
-from dataclasses import dataclass, field
-from functools import cached_property
-from pathlib import Path
+from dataclasses import dataclass, field, replace
 
 import click
 import httpx
 
-from . import targets
-from .node import Device, NodeConfig, RvsError, hold_rule
-from .panel import Panel
-from .ctl import Remote
-from .targets import Target
-from .tunnel import SessionOptions, run_session
+from . import routing
+from .node import Device, RvsError, hold_rule
+from .session import SessionOptions, run_session
+from .targets import Fleet, Target
 from .xray import Entry, client_config, device_rule
 
 log = logging.getLogger("pasarguard_rvs")
@@ -44,9 +41,7 @@ class Ctx:
     password: str | None = field(repr=False)
     node_name: str | None
 
-    @cached_property
-    def panel(self) -> Panel:
-        """Logged in on first use, so --help and the like never touch the panel."""
+    def fleet(self) -> Fleet:
         given = {
             "--panel/RVS_PANEL": self.panel_url,
             "--admin/RVS_PANEL_ADMIN": self.admin,
@@ -54,26 +49,16 @@ class Ctx:
         }
         if missing := [name for name, value in given.items() if not value]:
             raise click.UsageError("missing " + ", ".join(missing))
-        try:
-            panel = Panel(self.panel_url, self.admin, self.password)
-        except httpx.HTTPError as exc:
-            raise click.ClickException(f"panel login failed: {exc}") from exc
-        return click.get_current_context().with_resource(panel)
+        return Fleet(self.panel_url, self.admin, self.password, self.node_name)
 
-    @cached_property
-    def nodes(self) -> list[NodeConfig]:
-        return targets.nodes(self.panel, self.node_name)
 
-    def online(self, user_id: int | None = None) -> list[Target]:
-        return targets.online(self.panel, self.nodes, user_id)
-
-    def target(self, device: Device | None, query: str, allow_offline: bool) -> Target:
-        """From -d, or from the picker over what is online."""
-        if device:
-            return targets.find(self.panel, self.nodes, device, allow_offline)
-        if not (online := self.online()):
-            raise click.ClickException("no devices connected (or none of their users resolve in the panel)")
-        return online[_pick([t.line for t in online], query, "device (username  uid.row  node  ingress IPs):")]
+def _target(fleet: Fleet, device: Device | None, query: str, allow_offline: bool) -> Target:
+    """From -d, or from the picker over what is online."""
+    if device:
+        return fleet.find(device, allow_offline=allow_offline)
+    if not (online := fleet.online()):
+        raise click.ClickException("no devices connected (or none of their users resolve in the panel)")
+    return online[_pick([t.line for t in online], query, "device (username  uid.row  node  ingress IPs):")]
 
 
 class _Group(click.Group):
@@ -111,22 +96,34 @@ def _options(*decorators):
     return apply
 
 
-TARGET_OPTIONS = _options(
-    opt(
-        "-d",
-        "--device",
-        callback=_device,
-        env="RVS_DEVICE",
-        help="user_id[.row_id] to use without the picker (no row_id = the shared tunnel)",
-    ),
-    opt("-q", "--query", default="", env="RVS_QUERY", help="pre-fill the fuzzy search"),
-    opt(
-        "--allow-offline",
-        is_flag=True,
-        env="RVS_ALLOW_OFFLINE",
-        help="with -d: go ahead even if the device isn't connected (needs a single node, e.g. --node); "
-        "traffic fails until it connects, then flows with nothing restarted",
-    ),
+def target_options(env: bool):
+    """-d / -q / --allow-offline. `rvs select` has no env vars: the shell inherits the session's."""
+
+    def var(name: str) -> str | None:
+        return name if env else None
+
+    return _options(
+        opt(
+            "-d",
+            "--device",
+            callback=_device,
+            env=var("RVS_DEVICE"),
+            help="user_id[.row_id] to use without the picker (no row_id = the shared tunnel)",
+        ),
+        opt("-q", "--query", default="", env=var("RVS_QUERY"), help="pre-fill the fuzzy search"),
+        opt(
+            "--allow-offline",
+            is_flag=True,
+            env=var("RVS_ALLOW_OFFLINE"),
+            help="with -d: go ahead even if the device isn't connected (needs a single node, e.g. --node); "
+            "traffic fails until it connects, then flows with nothing restarted",
+        ),
+    )
+
+
+TAKE_OVER_HELP = (
+    "replace another rvs rule routing the same user on that node (a session that didn't exit cleanly; "
+    "a live one is cut off and blocks its traffic)"
 )
 ENTRY_OPTION = opt(
     "--entry-encryption",
@@ -165,7 +162,7 @@ def main(ctx: click.Context, panel, admin, password, node_name):
 @click.pass_obj
 def devices(c: Ctx, user_id: int | None, as_json: bool):
     """List devices online now (read-only; tunnels untouched). IPs are ingress, not egress."""
-    online = c.online(user_id)
+    online = c.fleet().online(user_id)
     if as_json:
         rows = [
             {
@@ -188,80 +185,64 @@ def devices(c: Ctx, user_id: int | None, as_json: bool):
 
 
 @main.command()
-@TARGET_OPTIONS
+@target_options(env=True)
 @ENTRY_OPTION
 @opt("--mtu", default=SESSION.mtu, env="RVS_MTU")
 @opt("--dns", default=SESSION.dns, env="RVS_DNS", help="resolver the shell uses, reached through the device")
+@opt("--shell", "shell_cmd", default=lambda: SessionOptions().shell, env="RVS_SHELL", show_default="$SHELL or /bin/bash")
+@opt("--take-over", is_flag=True, env="RVS_TAKE_OVER", help="for the first device: " + TAKE_OVER_HELP)
 @opt(
-    "--shell",
-    "shell_cmd",
-    default=lambda: SessionOptions().shell,
-    env="RVS_SHELL",
-    show_default="$SHELL or /bin/bash",
-)
-@opt(
-    "--dry-run",
-    is_flag=True,
-    env="RVS_DRY_RUN",
-    help="print the session's commands (and, with a device, its xray config), change nothing",
+    "--check-interval",
+    type=float,
+    default=SESSION.check_interval,
+    env="RVS_CHECK_INTERVAL",
+    help="seconds between checks that the node still routes to the device (traffic is blocked if not); 0: off",
 )
 @click.pass_obj
-def session(c: Ctx, device, query, allow_offline, encryption, mtu, dns, shell_cmd, dry_run):
+def session(c: Ctx, device, query, allow_offline, encryption, mtu, dns, shell_cmd, take_over, check_interval):
     """The container's entrypoint: a shell whose traffic exits through the device `rvs select` picks.
 
-    Needs NET_ADMIN and /dev/net/tun. Everything the shell runs goes through the device, the panel
-    and every node included; only xray's link to the entry and rvs's own panel/node calls go direct.
-    It starts with the picker (-d: that device; no terminal: none); until a device is selected,
-    traffic is blocked. -d/-q/--allow-offline are the first `rvs select`'s.
+    Needs NET_ADMIN, /dev/net/tun and the image's entrypoint (which runs rvs as its own uid).
+    Everything the shell runs goes through the device, the panel and every node included; only
+    xray's link to the entry and rvs's own panel/node calls go direct. It starts with the picker
+    (-d: that device, or no session; no terminal: none); until a device is selected, traffic is
+    blocked.
     """
-    if not dry_run and (os.geteuid() != 0 or not Path("/dev/net/tun").exists()):
-        raise click.ClickException("needs root in a container with NET_ADMIN and /dev/net/tun (try --dry-run)")
-    entry = _entry(encryption)
-    nodes = c.nodes  # log in and list the nodes now, before the tun exists
-    if entry.host and len(nodes) > 1:
+    routing.preflight()  # before the picker, not after
+    entry, fleet = _entry(encryption), c.fleet()
+    if entry.host:
         # one fixed entry reaches one node: a device elsewhere would exit at that node, by its own
         # rules, and not at the device
-        raise click.UsageError("RVS_ENTRY_HOST is one node's entry: pick that node with --node / RVS_NODE")
-    remote = Remote(c.panel_url, c.admin, c.password, nodes[0].name if entry.host else c.node_name)
-    opts = SessionOptions(mtu, dns, shell_cmd, dry_run)
-    interactive = sys.stdout.isatty()
-
-    def first_select():
-        if device is None and not interactive:
-            return
+        if len(nodes := fleet.nodes()) > 1:
+            raise click.UsageError("RVS_ENTRY_HOST is one node's entry: pick that node with --node / RVS_NODE")
+        fleet = replace(fleet, node_name=nodes[0].name)
+    first = None
+    if device or sys.stdout.isatty():
         try:
-            _select(device, query, allow_offline)
-        except click.ClickException as exc:
-            if device is not None:
-                raise  # asked for this device: no session without it
-            click.echo(f"Error: {exc.message}", err=True)
-
-    preview = c.target(device, query, allow_offline) if dry_run and (device or interactive) else None
-    run_session(entry, opts, remote, first_select, preview)
+            first = _target(fleet, device, query, allow_offline)
+        except (click.ClickException, RvsError) as exc:
+            if device:
+                raise
+            click.echo(f"Error: {exc}", err=True)
+    opts = SessionOptions(mtu, dns, shell_cmd, check_interval)
+    run_session(entry, opts, fleet, first, take_over, need_first=device is not None)
 
 
 @main.command()
-@opt("-d", "--device", callback=_device, help="user_id[.row_id] to use without the picker (no row_id = the shared tunnel)")
-@opt("-q", "--query", default="", help="pre-fill the fuzzy search")
-@opt(
-    "--allow-offline",
-    is_flag=True,
-    help="with -d: go ahead even if the device isn't connected (needs a single session node, e.g. --node); "
-    "traffic fails until it connects, then flows with nothing restarted",
-)
+@target_options(env=False)
 @opt("--dry-run", is_flag=True, help="print the node rule and xray config it would use, change nothing")
-def select(device, query, allow_offline, dry_run):
+@opt("--take-over", is_flag=True, help=TAKE_OVER_HELP)
+def select(device, query, allow_offline, dry_run, take_over):
     """Inside `rvs session`: exit through this device from now on (restarts the tunnel).
 
     Devices are found on the session's nodes (its --node / RVS_NODE). Open connections drop. If the
     device can't be found, the current one stays; if it is found but can't be brought up, traffic
     stays blocked until a select succeeds.
+
+    Refused while another rvs rule routes the same user on that node (the node can't tell two
+    sessions of one user apart): pick another user's device, or --take-over. While the session runs
+    it keeps checking that the node routes to the device, and blocks traffic if it stops.
     """
-    _select(device, query, allow_offline, dry_run)
-
-
-def _select(device: Device | None, query: str, allow_offline: bool, dry_run: bool = False) -> None:
-    """`rvs select`, as a client of the session's control socket."""
     if not (sock := os.environ.get("RVS_SOCK")):
         raise click.ClickException("not inside an rvs session (no RVS_SOCK)")
     node_name = None
@@ -269,17 +250,23 @@ def _select(device: Device | None, query: str, allow_offline: bool, dry_run: boo
         listed = _control(sock, {"op": "list"})
         if not listed["targets"]:
             raise click.ClickException("no devices connected (or none of their users resolve in the panel)")
-        lines = [t["line"] for t in listed["targets"]]
         now = listed["current"] or "none"
+        lines = [t["line"] for t in listed["targets"]]
         pick = listed["targets"][_pick(lines, query, f"device (now: {now}; username  uid.row  node  ingress IPs):")]
         device, node_name = pick["device"], pick["node"]
-    request = {"device": str(device), "node": node_name, "allow_offline": allow_offline, "dry_run": dry_run}
+    request = {
+        "op": "select",
+        "device": str(device),
+        "node": node_name,
+        "allow_offline": allow_offline,
+        "dry_run": dry_run,
+        "take_over": take_over,
+    }
     if dry_run:
-        click.echo(json.dumps(_control(sock, {"op": "select", **request})["plan"], indent=2))
+        click.echo(json.dumps(_control(sock, request)["plan"], indent=2))
         return
     click.echo(f"selecting {device}...", err=True)
-    reply = _control(sock, {"op": "select", **request})
-    click.echo(f"traffic now exits device {reply['current']}", err=True)
+    click.echo(f"traffic now exits device {_control(sock, request)['current']}", err=True)
 
 
 def _control(sock: str, request: dict) -> dict:
@@ -297,17 +284,20 @@ def _control(sock: str, request: dict) -> dict:
 
 
 @main.command()
-@TARGET_OPTIONS
+@target_options(env=True)
 @ENTRY_OPTION
 @opt("--json", "as_json", is_flag=True, help="print an xray client config (SOCKS5 + HTTP on 127.0.0.1)")
 @opt("--rule", "as_rule", is_flag=True, help="print the node routing rule that config needs")
 @opt("--hold", is_flag=True, help="with --rule: add it on the node instead, and remove it on Ctrl-C")
+@opt("--take-over", is_flag=True, help="with --hold: " + TAKE_OVER_HELP)
 @opt("--socks-port", default=10808, env="RVS_SOCKS_PORT", help="--json: SOCKS5 port; HTTP is the next one")
 @opt(
     "-o", "--output", type=click.File("w"), default="-", help="where --json/--rule go (a file keeps the picker usable)"
 )
 @click.pass_obj
-def standalone(c: Ctx, device, query, allow_offline, encryption, as_json, as_rule, hold, socks_port, output):
+def standalone(
+    c: Ctx, device, query, allow_offline, encryption, as_json, as_rule, hold, take_over, socks_port, output
+):
     """No local tunnel: the pieces to reach a device from your own xray.
 
     \b
@@ -322,17 +312,19 @@ def standalone(c: Ctx, device, query, allow_offline, encryption, as_json, as_rul
         raise click.UsageError("give exactly one of --json, --rule")
     if hold and not as_rule:
         raise click.UsageError("--hold goes with --rule")
-    target = c.target(device, query, allow_offline)
+    if take_over and not hold:
+        raise click.UsageError("--take-over goes with --hold")
+    target = _target(c.fleet(), device, query, allow_offline)
     log.info("device %s on node %s", target.device, target.node.name)
     entry = _entry(encryption)
-    rule = device_rule(target.device, entry.tag)
     if hold:
-        hold_rule(target.node, rule)
+        # held rules get an owner id, like a session's: removing it never removes someone else's
+        hold_rule(target.node, device_rule(target.device, entry.tag, secrets.token_hex(3)), take_over)
         return
     if as_json:
         doc = client_config(target.user.main_uuid, entry.address(target.node), entry, socks_port)
     else:
-        doc = rule
+        doc = device_rule(target.device, entry.tag)
     output.write(json.dumps(doc, indent=2) + "\n")
 
 

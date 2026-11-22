@@ -1,17 +1,22 @@
-"""Xray JSON, and nothing else: no I/O, no network. Every config here reaches a device the same way:
+"""Xray: the JSON, and running it for the session. Every config here reaches a device the same way:
 
   client --VLESS, user's MAIN uuid--> node entry inbound --device_rule--> r-<device> reverse outbound
 
 The entry inbound authenticates the user; the rule on the node is what picks the device.
 """
 
+import subprocess
+import tempfile
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
-from .node import Device, NodeConfig
+from .node import RULE_PREFIX, Device, NodeConfig, RvsError
 
 TUN_NAME = "rvstun0"
 TUN_CIDR = "10.77.0.1/30"
 HALF_ROUTES = ["0.0.0.0/1", "128.0.0.0/1"]  # beat the default route without replacing it
+LOG = Path(tempfile.gettempdir()) / "rvs-xray.log"  # kept out of the interactive shell
 
 
 @dataclass(frozen=True)
@@ -28,10 +33,13 @@ class Entry:
         return self.host or node.address
 
 
-def device_rule(device: Device, entry_tag: str) -> dict:
-    """Node routing rule: this user's traffic on the entry inbound goes out the device's reverse outbound."""
+def device_rule(device: Device, entry_tag: str, owner: str | None = None) -> dict:
+    """Node routing rule: this user's traffic on the entry inbound goes out the device's reverse outbound.
+
+    `owner` (a per-session id) makes the tag unique, so removing it never removes someone else's.
+    """
     return {
-        "ruleTag": f"rvs-shell-{device}",
+        "ruleTag": f"{RULE_PREFIX}{device}" + (f"-{owner}" if owner else ""),
         "inboundTag": [entry_tag],
         "user": [str(device.user_id)],
         "outboundTag": device.outbound_tag,
@@ -64,11 +72,8 @@ def _config(inbounds: list[dict], main_uuid: str, address: str, entry: Entry) ->
     }
 
 
-def tun_config(main_uuid: str, entry_ip: str, entry: Entry, mtu: int, mark: int) -> dict:
-    """For the container session: a tun that xray routes itself (Linux, Xray >= 26.6.27).
-
-    The entry connection carries SO_MARK `mark`; the session routes that mark around the tun.
-    """
+def tun_config(main_uuid: str, entry_ip: str, entry: Entry, mtu: int) -> dict:
+    """For the container session: a tun that xray routes itself (Linux, Xray >= 26.6.27)."""
     tun = {
         "tag": "tun",
         "protocol": "tun",
@@ -80,9 +85,7 @@ def tun_config(main_uuid: str, entry_ip: str, entry: Entry, mtu: int, mark: int)
             "autoOutboundsInterface": "auto",  # xray's own sockets bind to the default-route iface
         },
     }
-    cfg = _config([tun], main_uuid, entry_ip, entry)
-    cfg["outbounds"][0]["streamSettings"]["sockopt"] = {"mark": mark}
-    return cfg
+    return _config([tun], main_uuid, entry_ip, entry)
 
 
 def client_config(main_uuid: str, address: str, entry: Entry, socks_port: int) -> dict:
@@ -94,3 +97,27 @@ def client_config(main_uuid: str, address: str, entry: Entry, socks_port: int) -
     socks = {"tag": "socks", "protocol": "socks", "port": socks_port, **local, "settings": {"udp": True}}
     http = {"tag": "http", "protocol": "http", "port": socks_port + 1, **local}
     return _config([socks, http], main_uuid, address, entry)
+
+
+def start(cfg_path: Path) -> subprocess.Popen:
+    """Run xray on the config; return once it has put HALF_ROUTES into its tun (or failed)."""
+    proc = subprocess.Popen(["xray", "run", "-c", str(cfg_path)], stdout=LOG.open("w"), stderr=subprocess.STDOUT)
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RvsError(f"xray exited ({proc.returncode}); see {LOG}")
+            show = ["ip", "route", "show", "dev", TUN_NAME]
+            if all(h in subprocess.run(show, check=False, capture_output=True, text=True).stdout for h in HALF_ROUTES):
+                return proc
+            time.sleep(0.2)
+        raise RvsError(f"xray never routed {TUN_NAME}; see {LOG}")
+    except BaseException:
+        stop(proc)
+        raise
+
+
+def stop(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+    proc.wait(timeout=10)

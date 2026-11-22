@@ -40,17 +40,41 @@ set the session needs a single node (`--node` / `RVS_NODE`), since that entry is
 session go through the device (or fail before one is selected): run them as their own
 `docker compose run`.
 
+## Several people at once
+
+Each `docker compose run` is its own container, so local routing never collides. The node is
+shared: its rule sends entry traffic to a device by panel user, and every session of one user
+authenticates as that user, so the node can't tell them apart. Hence:
+
+- Devices of different users: independent, any number of sessions.
+- A second session for a user that already has one on that node (same device or another of its
+  devices) is refused: `already routed by rvs-shell-...`. A rule left by a session that didn't exit
+  cleanly looks the same; `--take-over` (on `rvs select`, `rvs session`, `standalone --hold`)
+  removes it. Taking over from a live session cuts that session off.
+- While a session runs it asks the node every 15 s (`--check-interval`) which outbound the user's
+  entry traffic takes. If it is no longer the device (taken over, the rule gone after a node
+  resync, an earlier rule on the node matching first), it stops xray and says so: traffic is
+  blocked, never silently exiting at the node or another device. A select runs the same check at
+  once.
+
+Rule tags carry a per-session id (`rvs-shell-<device>-<id>`), so a session only ever removes its
+own rule.
+
 ## What goes through the device
 
 Everything the shell runs, the panel and every node included (the session's own node too), so you
-can test them as the device sees them. Only rvs's own plumbing leaves the container directly, on its
-original default route (table 77): xray's link to the entry inbound (SO_MARK 0x77), and rvs's panel
-and node calls during the session, which run in a helper process as uid 7777. Run nothing else as
-uid 7777 in the shell. Replies to that direct traffic need reverse-path filtering off in the
-container (`net.ipv4.conf.{all,default}.rp_filter=0`, set in `compose.yaml`): even loose mode drops
-them while xray is down, e.g. mid-select. `rvs session` refuses to start otherwise.
-During the session the helper resolves names through the session's DNS (`--dns`, reached directly),
-not the container's original resolver, so the panel and node addresses must be public names or IPs.
+can test them as the device sees them. Only rvs itself leaves the container directly, on its
+original default route (table 77): the image's entrypoint (`as-rvs`) runs rvs as uid 7777 with the
+few capabilities it needs, and the session routes that uid around the tun. That covers rvs's panel
+and node calls and the xray it starts (its link to the entry inbound); the shell is started as full
+root, so it doesn't. Run nothing else as uid 7777 in the shell. `rvs session` refuses to start as
+any other uid (e.g. with `--entrypoint` overridden).
+
+Replies to that direct traffic need reverse-path filtering off in the container
+(`net.ipv4.conf.{all,default}.rp_filter=0`, set in `compose.yaml`): even loose mode drops them while
+xray is down, e.g. mid-select. `rvs session` refuses to start otherwise. rvs resolves names through
+the session's DNS (`--dns`, reached directly), not the container's original resolver, so the panel
+and node addresses must be public names or IPs.
 
 ## Standalone: your own xray instead of the container's tunnel
 
@@ -97,7 +121,7 @@ mounted directory instead.
 docker build -t rvs .
 docker run --rm --cap-add NET_ADMIN --device /dev/net/tun --sysctl net.ipv4.conf.all.rp_filter=0 \
   --sysctl net.ipv4.conf.default.rp_filter=0 \
-  -v "$PWD/tests:/h:ro" --entrypoint python rvs /h/routing_harness.py
+  -v "$PWD/tests:/h:ro" --entrypoint as-rvs rvs python /h/routing_harness.py
 ```
 
 ## Vendored from the panel repo

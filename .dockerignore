@@ -4,4 +4,5 @@
 !src/
 !proto/service.proto
 !scripts/regenerate_node_bridge_proto.py
+!scripts/as-rvs
 **/__pycache__
