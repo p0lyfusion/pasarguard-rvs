@@ -1,17 +1,56 @@
 # pasarguard-rvs
 
 Shells through Pasarguard VLESS reverse-tunnel devices. `rvs devices` lists the devices online on
-the panel's nodes; `rvs shell` fuzzy-picks one and opens a shell whose traffic exits through it.
-Everything runs in a container: the tun, routes and resolv.conf changes never touch the host.
+the panel's nodes. The container runs a session: a shell whose traffic exits through the device
+`rvs select` fuzzy-picks, and running `rvs select` again moves it to another one. Everything runs in
+a container: the tun, routes and resolv.conf changes never touch the host.
 
 ```
 cp rvs.env.example .env && $EDITOR .env
-docker compose run --rm rvs                 # = rvs shell: pick a device, get a shell through it
-docker compose run --rm rvs shell -d 42.7   # no picker; finds the node the device is on, refuses if it's offline
-docker compose run --rm rvs devices         # list what's online
+docker compose run --rm rvs                   # = rvs session: opens the picker, then the shell
+docker compose run --rm rvs session -d 42.7   # start on that device; refuses if it's offline
+docker compose run --rm rvs devices           # list what's online
 ```
 
 Inside the shell, `curl -s ifconfig.me` should print the device's public IP.
+
+## Selecting devices
+
+```
+rvs select              # inside the shell: pick a device (any user, any node)
+rvs select -d 51.3      # no picker
+rvs select -d 51.3 --allow-offline   # go ahead before it connects (needs a single session node)
+rvs select --dry-run    # print the node rule and xray config it would use, change nothing
+```
+
+The session starts with no device, and traffic is blocked until a select succeeds. Cancel the
+first picker (or run without a terminal and without `-d`) to get the shell anyway; `-d` on
+`rvs session` refuses to start without that device.
+
+A select stops xray, moves the node rule (old one removed, then the new one added, on whichever
+node each device is on) and starts xray again, so open connections drop and nothing keeps exiting
+through the old device. If the new device can't be found, the shell stays on the current one; if it
+is found but fails to come up, traffic stays blocked until a select succeeds.
+
+Moving to another node assumes every node's entry inbound shares the same port, tag and VLESS
+encryption key (the session has one of each); a mismatch only fails closed. With `RVS_ENTRY_HOST`
+set the session needs a single node (`--node` / `RVS_NODE`), since that entry is one node's.
+
+`rvs devices` and `rvs standalone` make their own panel and node calls, which from inside the
+session go through the device (or fail before one is selected): run them as their own
+`docker compose run`.
+
+## What goes through the device
+
+Everything the shell runs, the panel and every node included (the session's own node too), so you
+can test them as the device sees them. Only rvs's own plumbing leaves the container directly, on its
+original default route (table 77): xray's link to the entry inbound (SO_MARK 0x77), and rvs's panel
+and node calls during the session, which run in a helper process as uid 7777. Run nothing else as
+uid 7777 in the shell. Replies to that direct traffic need reverse-path filtering off in the
+container (`net.ipv4.conf.{all,default}.rp_filter=0`, set in `compose.yaml`): even loose mode drops
+them while xray is down, e.g. mid-select. `rvs session` refuses to start otherwise.
+During the session the helper resolves names through the session's DNS (`--dns`, reached directly),
+not the container's original resolver, so the panel and node addresses must be public names or IPs.
 
 ## Standalone: your own xray instead of the container's tunnel
 
@@ -56,8 +95,9 @@ mounted directory instead.
 
 ```
 docker build -t rvs .
-docker run --rm --cap-add NET_ADMIN --device /dev/net/tun -v "$PWD/tests:/h:ro" \
-  --entrypoint python rvs /h/routing_harness.py
+docker run --rm --cap-add NET_ADMIN --device /dev/net/tun --sysctl net.ipv4.conf.all.rp_filter=0 \
+  --sysctl net.ipv4.conf.default.rp_filter=0 \
+  -v "$PWD/tests:/h:ro" --entrypoint python rvs /h/routing_harness.py
 ```
 
 ## Vendored from the panel repo

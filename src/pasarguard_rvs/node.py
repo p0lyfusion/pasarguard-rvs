@@ -9,8 +9,6 @@ import asyncio
 import json
 import logging
 import signal
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
@@ -112,54 +110,73 @@ async def online_devices(node: NodeConfig) -> dict[Device, dict[str, int]]:
     return devices
 
 
-@asynccontextmanager
-async def routing_rule(node: NodeConfig, rule: dict) -> AsyncIterator[None]:
-    """Add `rule` (with a "ruleTag") on the node for the duration of the block; always remove it."""
+async def _add_rule(bridge, node: NodeConfig, rule: dict) -> None:
     from PasarGuardNodeBridge import NodeAPIError
 
     tag = rule["ruleTag"]
-    bridge = _bridge(node)
     try:
         try:
-            try:
-                await bridge.add_routing_rule(json.dumps(rule), should_reset=False)
-            except NodeAPIError as exc:
-                if "duplicate ruleTag" not in str(exc.detail):
-                    raise
-                # Left by a session that did not exit cleanly. The tag is per device, so the old
-                # rule is this same rule: replace it. (A session for this device that is still
-                # running loses its rule too -- one session per device is all the tag allows.)
-                log.warning("node %s: rule %s already there (stale session?); replacing it", node.name, tag)
-                await bridge.remove_routing_rule(tag)
-                await bridge.add_routing_rule(json.dumps(rule), should_reset=False)
+            await bridge.add_routing_rule(json.dumps(rule), should_reset=False)
         except NodeAPIError as exc:
-            raise RvsError(f"node {node.name}: adding rule failed: {exc.detail} (code {exc.code})") from exc
-        log.info("node %s: routing rule %s added", node.name, rule["ruleTag"])
-        yield
-    finally:
-        try:
-            await bridge.remove_routing_rule(rule["ruleTag"])
-            log.info("node %s: routing rule %s removed", node.name, rule["ruleTag"])
-        except Exception as exc:
-            log.error("failed to remove rule %s on node %s: %s -- remove it by hand", rule["ruleTag"], node.name, exc)
-        _close(bridge)
+            if "duplicate ruleTag" not in str(exc.detail):
+                raise
+            # Left by a session that did not exit cleanly. The tag is per device, so the old
+            # rule is this same rule: replace it. (A session for this device that is still
+            # running loses its rule too -- one session per device is all the tag allows.)
+            log.warning("node %s: rule %s already there (stale session?); replacing it", node.name, tag)
+            await bridge.remove_routing_rule(tag)
+            await bridge.add_routing_rule(json.dumps(rule), should_reset=False)
+    except NodeAPIError as exc:
+        raise RvsError(f"node {node.name}: adding rule failed: {exc.detail} (code {exc.code})") from exc
+    log.info("node %s: routing rule %s added", node.name, tag)
 
 
-def hold_rule(node: NodeConfig, rule: dict, during: Callable[[], object] | None = None) -> None:
-    """Add `rule` on the node, run the blocking `during()` (or, without one, wait for SIGINT/SIGTERM),
-    and always remove the rule afterwards."""
+async def _remove_rule(bridge, node: NodeConfig, tag: str) -> None:
+    from PasarGuardNodeBridge import NodeAPIError
+
+    try:
+        await bridge.remove_routing_rule(tag)
+    except NodeAPIError as exc:
+        raise RvsError(f"node {node.name}: removing rule {tag} failed: {exc.detail} (code {exc.code})") from exc
+    log.info("node %s: routing rule %s removed", node.name, tag)
+
+
+def _on_bridge(node: NodeConfig, call) -> None:
+    """Run `await call(bridge)` on a fresh bridge to the node, closing it afterwards."""
 
     async def go():
-        if during:
-            async with routing_rule(node, rule):
-                await asyncio.to_thread(during)
-            return
-        # before the add: a signal during the add RPC still ends in the removal
-        stop = asyncio.Event()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            asyncio.get_running_loop().add_signal_handler(sig, stop.set)
-        async with routing_rule(node, rule):
-            log.info("holding rule %s on %s; Ctrl-C removes it", rule["ruleTag"], node.name)
-            await stop.wait()
+        bridge = _bridge(node)
+        try:
+            await call(bridge)
+        finally:
+            _close(bridge)
 
     asyncio.run(go())
+
+
+def add_rule(node: NodeConfig, rule: dict) -> None:
+    """Add `rule` (with a "ruleTag") on the node; an identical stale one is replaced."""
+    _on_bridge(node, lambda bridge: _add_rule(bridge, node, rule))
+
+
+def remove_rule(node: NodeConfig, tag: str) -> None:
+    _on_bridge(node, lambda bridge: _remove_rule(bridge, node, tag))
+
+
+def hold_rule(node: NodeConfig, rule: dict) -> None:
+    """Add `rule` on the node, wait for SIGINT/SIGTERM, and always remove the rule afterwards."""
+    stop = (signal.SIGINT, signal.SIGTERM)
+    # blocked from before the add: a signal during the add RPC is kept, and still ends in the removal
+    signal.pthread_sigmask(signal.SIG_BLOCK, stop)
+    try:
+        add_rule(node, rule)
+        try:
+            log.info("holding rule %s on %s; Ctrl-C removes it", rule["ruleTag"], node.name)
+            signal.sigwait(stop)
+        finally:
+            try:
+                remove_rule(node, rule["ruleTag"])
+            except Exception as exc:
+                log.error("%s -- remove it by hand", exc)
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, stop)

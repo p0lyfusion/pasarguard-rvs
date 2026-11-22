@@ -1,10 +1,11 @@
 # rvs: shells through Pasarguard reverse-tunnel devices. Interactive, so start it with `run`, not `up`:
 #
 #   cp rvs.env.example .env && $EDITOR .env    # .env is gitignored
-#   docker compose run --rm rvs                # = rvs shell: pick a device, get a shell through it
-#   docker compose run --rm rvs shell -q alice # pre-fill the search
-#   docker compose run --rm rvs shell -d 42.7  # no picker
-#   docker compose run --rm rvs devices        # just list what's online
+#   docker compose run --rm rvs                  # = rvs session: pick a device, get a shell through it
+#   docker compose run --rm rvs session -q alice # pre-fill the search
+#   docker compose run --rm rvs session -d 42.7  # no picker
+#   docker compose run --rm rvs devices          # just list what's online
+#   (inside the shell) rvs select                # move the shell to another device
 #
 # Flags beat .env. All network changes (tun, routes, resolv.conf) stay inside this container.
 services:
@@ -17,3 +18,9 @@ services:
     tty: true
     cap_add: [NET_ADMIN]
     devices: ["/dev/net/tun:/dev/net/tun"]
+    # no reverse-path filtering: replies to rvs's own direct traffic arrive on eth0 from addresses
+    # the session routes into the tun (or, while xray is down, to `prohibit`). `default` is what
+    # eth0 starts with; the effective value is max(all, eth0).
+    sysctls:
+      net.ipv4.conf.all.rp_filter: 0
+      net.ipv4.conf.default.rp_filter: 0

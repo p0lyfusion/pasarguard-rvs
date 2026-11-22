@@ -31,4 +31,4 @@ COPY --from=xray /usr/local/bin/xray /usr/local/bin/xray
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 ENTRYPOINT ["rvs"]
-CMD ["shell"]
+CMD ["session"]

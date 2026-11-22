@@ -2,8 +2,9 @@
 
 \b
   rvs devices          list the devices online on the panel's connected nodes
-  rvs shell            fuzzy-pick one of them, get a shell whose traffic exits through it
-  rvs shell -d 42.7    skip the picker
+  rvs session          the container's entrypoint: a shell whose traffic exits through a device
+  rvs select           inside it: fuzzy-pick the device (again, to move to another one)
+  rvs select -d 42.7   skip the picker (rvs session -d 42.7: start on that device)
   rvs standalone --json   an xray client config for the device, to run anywhere
   rvs standalone --rule   the node routing rule that config needs (--hold: add it until Ctrl-C)
 
@@ -15,6 +16,7 @@ node's address), RVS_ENTRY_PORT (10900), RVS_ENTRY_TAG (RVS_ENTRY).
 import json
 import logging
 import os
+import socket
 import sys
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -26,8 +28,9 @@ import httpx
 from . import targets
 from .node import Device, NodeConfig, RvsError, hold_rule
 from .panel import Panel
+from .ctl import Remote
 from .targets import Target
-from .tunnel import SessionOptions, run_device_shell
+from .tunnel import SessionOptions, run_session
 from .xray import Entry, client_config, device_rule
 
 log = logging.getLogger("pasarguard_rvs")
@@ -59,13 +62,7 @@ class Ctx:
 
     @cached_property
     def nodes(self) -> list[NodeConfig]:
-        if nodes := self.panel.nodes(self.node_name):
-            return nodes
-        raise click.ClickException(
-            f"no connected gRPC node named {self.node_name!r}"
-            if self.node_name
-            else "the panel lists no connected gRPC nodes"
-        )
+        return targets.nodes(self.panel, self.node_name)
 
     def online(self, user_id: int | None = None) -> list[Target]:
         return targets.online(self.panel, self.nodes, user_id)
@@ -76,7 +73,7 @@ class Ctx:
             return targets.find(self.panel, self.nodes, device, allow_offline)
         if not (online := self.online()):
             raise click.ClickException("no devices connected (or none of their users resolve in the panel)")
-        return _pick(online, query)
+        return online[_pick([t.line for t in online], query, "device (username  uid.row  node  ingress IPs):")]
 
 
 class _Group(click.Group):
@@ -187,7 +184,7 @@ def devices(c: Ctx, user_id: int | None, as_json: bool):
         click.echo("no devices connected", err=True)
     else:
         for t in online:
-            click.echo(_line(t))
+            click.echo(t.line)
 
 
 @main.command()
@@ -202,14 +199,101 @@ def devices(c: Ctx, user_id: int | None, as_json: bool):
     env="RVS_SHELL",
     show_default="$SHELL or /bin/bash",
 )
-@opt("--dry-run", is_flag=True, env="RVS_DRY_RUN", help="print every command and the xray config, change nothing")
+@opt(
+    "--dry-run",
+    is_flag=True,
+    env="RVS_DRY_RUN",
+    help="print the session's commands (and, with a device, its xray config), change nothing",
+)
 @click.pass_obj
-def shell(c: Ctx, device, query, allow_offline, encryption, mtu, dns, shell_cmd, dry_run):
-    """Get a shell whose traffic exits through a device. Needs NET_ADMIN and /dev/net/tun."""
+def session(c: Ctx, device, query, allow_offline, encryption, mtu, dns, shell_cmd, dry_run):
+    """The container's entrypoint: a shell whose traffic exits through the device `rvs select` picks.
+
+    Needs NET_ADMIN and /dev/net/tun. Everything the shell runs goes through the device, the panel
+    and every node included; only xray's link to the entry and rvs's own panel/node calls go direct.
+    It starts with the picker (-d: that device; no terminal: none); until a device is selected,
+    traffic is blocked. -d/-q/--allow-offline are the first `rvs select`'s.
+    """
     if not dry_run and (os.geteuid() != 0 or not Path("/dev/net/tun").exists()):
         raise click.ClickException("needs root in a container with NET_ADMIN and /dev/net/tun (try --dry-run)")
-    target = c.target(device, query, allow_offline)
-    run_device_shell(target, _entry(encryption), SessionOptions(mtu, dns, shell_cmd, dry_run))
+    entry = _entry(encryption)
+    nodes = c.nodes  # log in and list the nodes now, before the tun exists
+    if entry.host and len(nodes) > 1:
+        # one fixed entry reaches one node: a device elsewhere would exit at that node, by its own
+        # rules, and not at the device
+        raise click.UsageError("RVS_ENTRY_HOST is one node's entry: pick that node with --node / RVS_NODE")
+    remote = Remote(c.panel_url, c.admin, c.password, nodes[0].name if entry.host else c.node_name)
+    opts = SessionOptions(mtu, dns, shell_cmd, dry_run)
+    interactive = sys.stdout.isatty()
+
+    def first_select():
+        if device is None and not interactive:
+            return
+        try:
+            _select(device, query, allow_offline)
+        except click.ClickException as exc:
+            if device is not None:
+                raise  # asked for this device: no session without it
+            click.echo(f"Error: {exc.message}", err=True)
+
+    preview = c.target(device, query, allow_offline) if dry_run and (device or interactive) else None
+    run_session(entry, opts, remote, first_select, preview)
+
+
+@main.command()
+@opt("-d", "--device", callback=_device, help="user_id[.row_id] to use without the picker (no row_id = the shared tunnel)")
+@opt("-q", "--query", default="", help="pre-fill the fuzzy search")
+@opt(
+    "--allow-offline",
+    is_flag=True,
+    help="with -d: go ahead even if the device isn't connected (needs a single session node, e.g. --node); "
+    "traffic fails until it connects, then flows with nothing restarted",
+)
+@opt("--dry-run", is_flag=True, help="print the node rule and xray config it would use, change nothing")
+def select(device, query, allow_offline, dry_run):
+    """Inside `rvs session`: exit through this device from now on (restarts the tunnel).
+
+    Devices are found on the session's nodes (its --node / RVS_NODE). Open connections drop. If the
+    device can't be found, the current one stays; if it is found but can't be brought up, traffic
+    stays blocked until a select succeeds.
+    """
+    _select(device, query, allow_offline, dry_run)
+
+
+def _select(device: Device | None, query: str, allow_offline: bool, dry_run: bool = False) -> None:
+    """`rvs select`, as a client of the session's control socket."""
+    if not (sock := os.environ.get("RVS_SOCK")):
+        raise click.ClickException("not inside an rvs session (no RVS_SOCK)")
+    node_name = None
+    if device is None:
+        listed = _control(sock, {"op": "list"})
+        if not listed["targets"]:
+            raise click.ClickException("no devices connected (or none of their users resolve in the panel)")
+        lines = [t["line"] for t in listed["targets"]]
+        now = listed["current"] or "none"
+        pick = listed["targets"][_pick(lines, query, f"device (now: {now}; username  uid.row  node  ingress IPs):")]
+        device, node_name = pick["device"], pick["node"]
+    request = {"device": str(device), "node": node_name, "allow_offline": allow_offline, "dry_run": dry_run}
+    if dry_run:
+        click.echo(json.dumps(_control(sock, {"op": "select", **request})["plan"], indent=2))
+        return
+    click.echo(f"selecting {device}...", err=True)
+    reply = _control(sock, {"op": "select", **request})
+    click.echo(f"traffic now exits device {reply['current']}", err=True)
+
+
+def _control(sock: str, request: dict) -> dict:
+    with socket.socket(socket.AF_UNIX) as s:
+        s.connect(sock)
+        s.sendall((json.dumps(request) + "\n").encode())
+        reply = json.loads(s.makefile().readline() or "{}")
+    if "error" in reply or not reply:
+        current = reply.get("current")
+        raise click.ClickException(
+            reply.get("error", "no reply from the session")
+            + (f" (still on {current})" if current else " (no device now: traffic is blocked)")
+        )
+    return reply
 
 
 @main.command()
@@ -246,17 +330,13 @@ def standalone(c: Ctx, device, query, allow_offline, encryption, as_json, as_rul
         hold_rule(target.node, rule)
         return
     if as_json:
-        doc = client_config(target.user.main_uuid, entry.host or target.node.address, entry, socks_port)
+        doc = client_config(target.user.main_uuid, entry.address(target.node), entry, socks_port)
     else:
         doc = rule
     output.write(json.dumps(doc, indent=2) + "\n")
 
 
-def _line(t: Target) -> str:
-    return f"{t.user.username}  {t.device}  {t.node.name}  {', '.join(sorted(t.ips))}"
-
-
-def _pick(online: list[Target], query: str) -> Target:
+def _pick(lines: list[str], query: str, message: str) -> int:
     from InquirerPy import inquirer
     from InquirerPy.base.control import Choice
 
@@ -265,12 +345,12 @@ def _pick(online: list[Target], query: str) -> Target:
     # The value is the list index: InquirerPy hands back an object value as a dict, not the object.
     try:
         index = inquirer.fuzzy(
-            message="device (username  uid.row  node  ingress IPs):",
-            choices=[Choice(value=i, name=_line(t)) for i, t in enumerate(online)],
+            message=message,
+            choices=[Choice(value=i, name=line) for i, line in enumerate(lines)],
             default=query,
         ).execute()
     except KeyboardInterrupt:
         index = None
     if index is None:
         raise click.ClickException("nothing selected")
-    return online[index]
+    return index

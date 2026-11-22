@@ -7,7 +7,7 @@ The entry inbound authenticates the user; the rule on the node is what picks the
 
 from dataclasses import dataclass
 
-from .node import Device
+from .node import Device, NodeConfig
 
 TUN_NAME = "rvstun0"
 TUN_CIDR = "10.77.0.1/30"
@@ -22,6 +22,10 @@ class Entry:
     host: str | None = None  # data-plane address; default: the node's address
     port: int = 10900
     tag: str = "RVS_ENTRY"
+
+    def address(self, node: NodeConfig) -> str:
+        """Where to reach the entry for a device on `node`."""
+        return self.host or node.address
 
 
 def device_rule(device: Device, entry_tag: str) -> dict:
@@ -60,8 +64,11 @@ def _config(inbounds: list[dict], main_uuid: str, address: str, entry: Entry) ->
     }
 
 
-def tun_config(main_uuid: str, entry_ip: str, entry: Entry, mtu: int) -> dict:
-    """For the container session: a tun that xray routes itself (Linux, Xray >= 26.6.27)."""
+def tun_config(main_uuid: str, entry_ip: str, entry: Entry, mtu: int, mark: int) -> dict:
+    """For the container session: a tun that xray routes itself (Linux, Xray >= 26.6.27).
+
+    The entry connection carries SO_MARK `mark`; the session routes that mark around the tun.
+    """
     tun = {
         "tag": "tun",
         "protocol": "tun",
@@ -73,7 +80,9 @@ def tun_config(main_uuid: str, entry_ip: str, entry: Entry, mtu: int) -> dict:
             "autoOutboundsInterface": "auto",  # xray's own sockets bind to the default-route iface
         },
     }
-    return _config([tun], main_uuid, entry_ip, entry)
+    cfg = _config([tun], main_uuid, entry_ip, entry)
+    cfg["outbounds"][0]["streamSettings"]["sockopt"] = {"mark": mark}
+    return cfg
 
 
 def client_config(main_uuid: str, address: str, entry: Entry, socks_port: int) -> dict:

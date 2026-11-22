@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 import httpx
 
@@ -22,6 +22,25 @@ class Target:
     device: Device
     user: PanelUser
     ips: dict[str, int] = field(default_factory=dict)  # ingress IP -> last seen; empty when offline
+
+    def to_json(self) -> dict:
+        return {"node": asdict(self.node), "device": str(self.device), "user": asdict(self.user), "ips": self.ips}
+
+    @classmethod
+    def from_json(cls, d: dict) -> Target:
+        return cls(NodeConfig(**d["node"]), Device.parse(d["device"]), PanelUser(**d["user"]), d["ips"])
+
+    @property
+    def line(self) -> str:
+        """One line for lists and the picker."""
+        return f"{self.user.username}  {self.device}  {self.node.name}  {', '.join(sorted(self.ips))}"
+
+
+def nodes(panel: Panel, name: str | None = None) -> list[NodeConfig]:
+    """The panel's connected gRPC nodes (only `name`, if given); none is an error."""
+    if found := panel.nodes(name):
+        return found
+    raise RvsError(f"no connected gRPC node named {name!r}" if name else "the panel lists no connected gRPC nodes")
 
 
 def online(panel: Panel, nodes: list[NodeConfig], user_id: int | None = None) -> list[Target]:
